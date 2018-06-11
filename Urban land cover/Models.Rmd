@@ -1,0 +1,329 @@
+---
+title: "Redhorse"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+setwd("C:/Users/sjcrum/Documents/RedHorse Project/Urban land cover")
+```
+
+
+
+```{r}
+training_df <- read.csv("training.csv")
+testing_df <- read.csv("testing.csv")
+
+df <- rbind(training_df, testing_df)
+
+set.seed(29)
+
+#split dummy data for training and testing on 75% partition
+inTraining <- createDataPartition(df$class, p = .60, list = FALSE)
+
+training <- df[inTraining,]
+testing <- df[-inTraining,]
+```
+
+
+
+```{r}
+#install.packages('ddalpha')
+#install.packages("magic")
+#install.packages("prodlim")
+#install.packages("lubridate")
+#install.packages("kknn")
+#install.packages("caret", dependencies=TRUE, repos='http://cran.rstudio.com/')
+#install.packages("xgboost", dependencies=TRUE, repos='http://cran.rstudio.com/')
+#install.packages("nnet")
+library(nnet)
+library(dplyr)
+library(ggplot2)
+library(caret)
+library(kknn)
+library(xgboost)
+```
+
+
+```{r}
+# normalize data of same scale
+normalize <- function(x) {
+    return ((x - min(x)) / (max(x) - min(x)))
+}
+
+train_label <- training[1]
+test_label <- testing[1]
+
+
+training_nm <- as.data.frame(cbind(train_label, 
+                                   sapply(training[2:148], function(x) {normalize(x)})))
+
+testing_nm <- as.data.frame(cbind(test_label, 
+                                   sapply(testing[2:148], function(x) {normalize(x)})))
+
+# Standardize data (mean = 0, sd = 1)
+
+training_scale <- as.data.frame(cbind(train_label, 
+                                   sapply(training_nm[2:148], function(x) {scale(x)})))
+
+testing_scale <- as.data.frame(cbind(test_label, 
+                                   sapply(testing_nm[2:148], function(x) {scale(x)})))
+```
+
+
+```{r}
+cor_matrix <- as.data.frame(cor(training_scale[-1]))
+
+cor_matrix
+```
+
+
+```{r}
+# training data by class
+
+totals <- training %>% group_by(class) %>% summarise(total = n())
+
+ggplot(totals, aes(x = reorder(class, total), y = total)) + geom_bar(stat = "identity", fill = "steelblue") + labs(x = "Class", y = "Total in Training", title = "Totals Observations in Training Set by Class") + geom_text(aes(label=totals$total), color = "white", position=position_dodge(width=0.4), hjust= 1.5, size = 5) + coord_flip()
+```
+
+```{r}
+# testing data by class
+
+totals_test <- testing %>% group_by(class) %>% summarise(total = n())
+
+ggplot(totals_test, aes(x = reorder(class, total), y = total)) + geom_bar(stat = "identity", fill = "salmon") + labs(x = "Class", y = "Total in Testing", title = "Totals Observations in Testing Set by Class") + geom_text(aes(label=totals_test$total), color = "white", position=position_dodge(width=0.4), hjust= 1.5, size = 5) + coord_flip()
+```
+
+
+
+
+```{r}
+# set seed for reproducibility
+set.seed(29)
+# create 5 folds to be used in cross validation
+myFolds <- createFolds(training_scale, k = 5)
+# create a custom trainControl object to use our folds; index = myFolds
+myControl = trainControl(verboseIter = TRUE, index = myFolds)
+
+# training grid
+tgrid <- expand.grid(
+  .mtry = seq(2, 140, 2),
+  .splitrule = "gini",
+  .min.node.size = 1
+)
+```
+
+
+
+
+
+
+```{r}
+set.seed(29)
+# Train glmnet with custom trainControl and tuning: model
+knn1 <- train(class ~ ., training_scale, method = "kknn", trControl = myControl)
+# Print model to console
+print(knn1)
+
+plot(knn1)
+
+```
+
+
+
+
+
+```{r}
+# Train elastic net with custom trainControl and tuning: model
+enet1 <- train(class ~ ., 
+               training_scale,
+               tuneGrid = expand.grid(alpha = seq(0,1,0.1), 
+                          lambda = seq(0.0001, 100, 10)),
+               method = "glmnet")
+
+
+print(enet1)
+
+plot(enet1)
+```
+
+
+
+
+
+
+```{r Prepare data for XGBoost model}
+
+#Create labels and predictor datasets for XGBoost model
+train_label <- training_scale$class 
+test_label <- testing_scale$class
+data_train <- as.matrix(subset(training_scale, select = -c(class))) 
+data_test <- as.matrix(subset(testing_scale, select = -c(class)))
+
+#Convert to numeric, subtract one to retain binary, and convert whole dataset to a matrix
+train_label_max <- as.matrix(as.numeric(train_label)-1)
+test_label_max <- as.matrix(as.numeric(test_label)-1)
+```
+
+
+
+```{r Create XGBoost Matrices}
+#Prepare XGBoost Matrices 
+dtrain <- xgb.DMatrix(data = data_train, label=train_label_max)
+dtest <- xgb.DMatrix(data = data_test, label=test_label_max)
+```
+
+
+
+```{r Parameters list}
+set.seed(29)
+
+NRoundsTest <- function(xgb_data, train_data){
+
+  numberOfClasses <- length(unique(train_data$class))
+  xgb_params <- list("objective" = "multi:softprob",
+                     "eval_metric" = "mlogloss",
+                     "num_class" = numberOfClasses)
+  nround  <- c() # number of XGBoost rounds
+  nrounds <- seq(100, 1000, 100)
+  
+  for (i in 1:length(nrounds)){
+    cv.nfold  <- 5
+    
+    # Fit cv.nfold * cv.nround XGB models and save OOF predictions
+    cv_model <- xgb.cv(params = xgb_params,
+                       data = xgb_data, 
+                       nrounds = nrounds[i],
+                       nfold = cv.nfold,
+                       verbose = FALSE,
+                       prediction = TRUE)
+    
+    OOF_prediction <- data.frame(cv_model$pred) %>%
+      mutate(max_prob = max.col(., ties.method = "last"),
+             label = train_label_max + 1)
+    head(OOF_prediction)
+    
+    conf <- confusionMatrix(factor(OOF_prediction$max_prob),
+                    factor(OOF_prediction$label),
+                    mode = "everything")
+    
+    nround[i] <- conf$overall["Accuracy"]
+  }
+  
+  df <- as.data.frame(cbind(nrounds, nround))
+
+  #Plot dataframe
+  ggplot(df) + geom_line(aes(x = nrounds, y = nround), color = "red") + labs(x = "NRounds", y = "Accuracy")
+}
+
+NRoundsTest(dtrain, training)
+```
+
+```{r}
+set.seed(29)
+
+numberOfClasses <- length(unique(training_scale$class))
+xgb_params <- list("objective" = "multi:softprob",
+                   "eval_metric" = "mlogloss",
+                   "num_class" = numberOfClasses)
+
+  
+cv.nfold  <- 5
+
+# Fit cv.nfold * cv.nround XGB models and save OOF predictions
+cv_model <- xgb.cv(params = xgb_params,
+                   data = dtrain, 
+                   nrounds = 600,
+                   nfold = cv.nfold,
+                   verbose = FALSE,
+                   prediction = TRUE)
+
+OOF_prediction <- data.frame(cv_model$pred) %>%
+  mutate(max_prob = max.col(., ties.method = "last"),
+         label = train_label_max + 1)
+head(OOF_prediction)
+
+conf_xgb <- confusionMatrix(factor(OOF_prediction$max_prob),
+                factor(OOF_prediction$label),
+                mode = "everything")
+
+conf_xgb
+```
+
+```{r}
+params <- list(booster = "gbtree", objective = "multi:softprob", eta=0.3, gamma=0, max_depth=20, min_child_weight=1, subsample=1, colsample_bytree=1, num_class = 9)
+
+xgb <- xgb.train (params = params, data = dtrain, nrounds = 1000, print_every_n = 50, early_stop_round = 10, maximize = F , eval_metric = "error", eval_metric = "auc")
+
+mat <- xgb.importance(feature_names = colnames(data_train),model = xgb)
+
+ggplot(mat[1:20,], aes(x = reorder(Feature, Gain), y = Gain)) + geom_bar(stat = "identity", fill = "salmon") + labs(x = "Feature", y = "Gain", title = "Feature Selection by XGBoost Model") + coord_flip()
+```
+```{r}
+predXGB <- predict(xgb, newdata = dtest)
+```
+
+```{r}
+test_prediction <- matrix(predXGB, nrow = numberOfClasses,
+                          ncol=length(predXGB)/numberOfClasses) %>%
+  t() %>%
+  data.frame() %>%
+  mutate(label = test_label + 1,
+         max_prob = max.col(., "last"))
+# confusion matrix of test set
+confusionMatrix(factor(test_prediction$max_prob - 1),
+                factor(test_label_max),
+                mode = "everything")
+```
+
+
+
+
+
+
+```{r}
+colNames <- mat$Feature[1:20]
+training_sign <- cbind(training_scale$class, subset(training_scale, select = c(colNames)))
+testing_sign <- cbind(testing_scale$class, subset(testing_scale, select = c(colNames)))
+
+colnames(training_sign)[1] <- "class"
+colnames(testing_sign)[1] <- "class"
+
+training_sign$class <- as.factor(as.numeric(training_sign$class))
+testing_sign$class <- as.factor(as.numeric(testing_sign$class))
+
+
+training_sign$class <- relevel(training_sign$class, ref = "1")
+testing_sign$class <- relevel(testing_sign$class, ref = "1")
+
+multimodel <- step(multinom(class ~ ., data = training_sign), direction = "both")
+summary(multimodel)
+
+pred <- predict(multimodel, newdata = testing_sign[-1], type = "c")
+
+pred_prob <- as.data.frame(predict(multimodel, newdata = testing_sign[-1], type = "prob"))
+
+pred_prob$max <- apply(pred_prob[, 1:9], 1, max)
+
+pred_prob$strength <- ifelse(pred_prob$max >= 0.75, "Strong(>=0.75)", "Weak(<0.75)")
+
+pred_prob$prediction <- colnames(pred_prob[1:9])[max.col(pred_prob[1:9], ties.method="first")]
+
+pred_prob$actual <- as.numeric(testing_scale$class)
+
+pred_prob$correct <- ifelse(pred_prob$prediction == pred_prob$actual, "Correct", "Wrong")
+
+a <- pred_prob %>% group_by(correct, strength) %>% summarise(total = n())
+
+ggplot(a, aes(x = factor(correct), y = total, fill = strength)) + 
+  geom_bar(stat="identity", position = "dodge") + scale_fill_brewer(palette = "Set1") + labs(x = "Prediction Result", y = "Total Observations", title = "Prediction Accuracy by Probabilistic Strength")
+
+
+confusionMatrix(pred, testing_sign$class)
+```
+
+
+
